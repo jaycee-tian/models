@@ -1,3 +1,3 @@
 # models
 
-1. Transformer
+1. ViT

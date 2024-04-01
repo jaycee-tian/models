@@ -1,10 +1,34 @@
 import torch
 from torch import nn
 
-from einops import rearrange, repeat, pack, unpack
+from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 
+# helpers
+
+def pair(t):
+    return t if isinstance(t, tuple) else (t, t)
+
 # classes
+
+class PatchDropout(nn.Module):
+    def __init__(self, prob):
+        super().__init__()
+        assert 0 <= prob < 1.
+        self.prob = prob
+
+    def forward(self, x):
+        if not self.training or self.prob == 0.:
+            return x
+
+        b, n, _, device = *x.shape, x.device
+
+        batch_indices = torch.arange(b, device = device)
+        batch_indices = rearrange(batch_indices, '... -> ... 1')
+        num_patches_keep = max(1, int(n * (1 - self.prob)))
+        patch_indices_keep = torch.randn(b, n, device = device).topk(num_patches_keep, dim = -1).indices
+
+        return x[batch_indices, patch_indices_keep]
 
 class FeedForward(nn.Module):
     def __init__(self, dim, hidden_dim, dropout = 0.):
@@ -70,66 +94,54 @@ class Transformer(nn.Module):
         return x
 
 class ViT(nn.Module):
-    def __init__(self, *, seq_len, patch_size, num_classes, dim, depth, heads, mlp_dim, channels = 3, dim_head = 64, dropout = 0., emb_dropout = 0.):
+    def __init__(self, *, image_size, patch_size, num_classes, dim, depth, heads, mlp_dim, pool = 'cls', channels = 3, dim_head = 64, dropout = 0., emb_dropout = 0., patch_dropout = 0.25):
         super().__init__()
-        assert (seq_len % patch_size) == 0
+        image_height, image_width = pair(image_size)
+        patch_height, patch_width = pair(patch_size)
 
-        num_patches = seq_len // patch_size
-        patch_dim = channels * patch_size
+        assert image_height % patch_height == 0 and image_width % patch_width == 0, 'Image dimensions must be divisible by the patch size.'
+
+        num_patches = (image_height // patch_height) * (image_width // patch_width)
+        patch_dim = channels * patch_height * patch_width
+        assert pool in {'cls', 'mean'}, 'pool type must be either cls (cls token) or mean (mean pooling)'
 
         self.to_patch_embedding = nn.Sequential(
-            Rearrange('b c (n p) -> b n (p c)', p = patch_size),
-            nn.LayerNorm(patch_dim),
+            Rearrange('b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1 = patch_height, p2 = patch_width),
             nn.Linear(patch_dim, dim),
-            nn.LayerNorm(dim),
         )
 
-        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
-        self.cls_token = nn.Parameter(torch.randn(dim))
+        self.pos_embedding = nn.Parameter(torch.randn(num_patches, dim))
+        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
+
+        self.patch_dropout = PatchDropout(patch_dropout)
         self.dropout = nn.Dropout(emb_dropout)
 
         self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim, dropout)
+
+        self.pool = pool
+        self.to_latent = nn.Identity()
 
         self.mlp_head = nn.Sequential(
             nn.LayerNorm(dim),
             nn.Linear(dim, num_classes)
         )
 
-    def forward(self, series):
-        x = self.to_patch_embedding(series)
+    def forward(self, img):
+        x = self.to_patch_embedding(img)
         b, n, _ = x.shape
 
-        cls_tokens = repeat(self.cls_token, 'd -> b d', b = b)
+        x += self.pos_embedding
 
-        x, ps = pack([cls_tokens, x], 'b * d')
+        x = self.patch_dropout(x)
 
-        x += self.pos_embedding[:, :(n + 1)]
+        cls_tokens = repeat(self.cls_token, '1 1 d -> b 1 d', b = b)
+
+        x = torch.cat((cls_tokens, x), dim=1)
         x = self.dropout(x)
 
         x = self.transformer(x)
 
-        cls_tokens, _ = unpack(x, ps, 'b * d')
+        x = x.mean(dim = 1) if self.pool == 'mean' else x[:, 0]
 
-        return self.mlp_head(cls_tokens)
-
-if __name__ == '__main__':
-
-    v = ViT(
-        seq_len = 256,
-        patch_size = 16,
-        num_classes = 1000,
-        dim = 1024,
-        depth = 6,
-        heads = 8,
-        mlp_dim = 2048,
-        dropout = 0.1,
-        emb_dropout = 0.1
-    )
-
-
-    '''
-    b = 4, c = 3, f = 256
-    切分多头依然是切的f，例如切成8个头，每个头32。
-    '''
-    time_series = torch.randn(4, 3, 256)
-    logits = v(time_series) # (4, 1000)
+        x = self.to_latent(x)
+        return self.mlp_head(x)
